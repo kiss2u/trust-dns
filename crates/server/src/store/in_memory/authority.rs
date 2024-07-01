@@ -91,7 +91,7 @@ impl InMemoryAuthority {
             .iter()
             .find(|(key, _)| key.record_type == RecordType::SOA)
             .and_then(|(_, rrset)| rrset.records_without_rrsigs().next())
-            .and_then(Record::data)
+            .map(Record::data)
             .and_then(RData::as_soa)
             .map(SOA::serial)
             .ok_or_else(|| format!("SOA record must be present: {origin}"))?;
@@ -345,7 +345,7 @@ impl InnerInMemory {
         self.records
             .get(&rr_key)
             .and_then(|rrset| rrset.records_without_rrsigs().next())
-            .and_then(Record::data)
+            .map(Record::data)
             .and_then(RData::as_soa)
     }
 
@@ -386,8 +386,8 @@ impl InnerInMemory {
         lookup_options: LookupOptions,
     ) -> Option<Arc<RecordSet>> {
         // this range covers all the records for any of the RecordTypes at a given label.
-        let start_range_key = RrKey::new(name.clone(), RecordType::Unknown(u16::min_value()));
-        let end_range_key = RrKey::new(name.clone(), RecordType::Unknown(u16::max_value()));
+        let start_range_key = RrKey::new(name.clone(), RecordType::Unknown(u16::MIN));
+        let end_range_key = RrKey::new(name.clone(), RecordType::Unknown(u16::MAX));
 
         fn aname_covers_type(key_type: RecordType, query_type: RecordType) -> bool {
             (query_type == RecordType::A || query_type == RecordType::AAAA)
@@ -449,9 +449,7 @@ impl InnerInMemory {
                 };
 
                 for record in records {
-                    if let Some(rdata) = record.data() {
-                        new_answer.add_rdata(rdata.clone());
-                    }
+                    new_answer.add_rdata(record.data().clone());
                 }
 
                 #[cfg(feature = "dnssec")]
@@ -548,7 +546,7 @@ impl InnerInMemory {
             return 0;
         };
 
-        let serial = if let Some(RData::SOA(ref mut soa_rdata)) = record.data_mut() {
+        let serial = if let RData::SOA(ref mut soa_rdata) = record.data_mut() {
             soa_rdata.increment_serial();
             soa_rdata.serial()
         } else {
@@ -610,9 +608,8 @@ impl InnerInMemory {
         }
 
         // check that CNAME and ANAME is either not already present, or no other records are if it's a CNAME
-        let start_range_key =
-            RrKey::new(record.name().into(), RecordType::Unknown(u16::min_value()));
-        let end_range_key = RrKey::new(record.name().into(), RecordType::Unknown(u16::max_value()));
+        let start_range_key = RrKey::new(record.name().into(), RecordType::Unknown(u16::MIN));
+        let end_range_key = RrKey::new(record.name().into(), RecordType::Unknown(u16::MAX));
 
         let multiple_records_at_label_disallowed = self
             .records
@@ -699,10 +696,9 @@ impl InnerInMemory {
                     }
                     Some((name, vec)) => {
                         // names aren't equal, create the NSEC record
-                        let mut record = Record::with(name.clone(), RecordType::NSEC, ttl);
                         let rdata = NSEC::new_cover_self(key.name.clone().into(), vec);
-                        record.set_data(Some(RData::DNSSEC(DNSSECRData::NSEC(rdata))));
-                        records.push(record);
+                        let record = Record::from_rdata(name.clone(), ttl, rdata);
+                        records.push(record.into_record_of_rdata());
 
                         // new record...
                         nsec_info = Some((key.name.borrow(), vec![key.record_type]))
@@ -713,10 +709,9 @@ impl InnerInMemory {
             // the last record
             if let Some((name, vec)) = nsec_info {
                 // names aren't equal, create the NSEC record
-                let mut record = Record::with(name.clone(), RecordType::NSEC, ttl);
                 let rdata = NSEC::new_cover_self(origin.clone().into(), vec);
-                record.set_data(Some(RData::DNSSEC(DNSSECRData::NSEC(rdata))));
-                records.push(record);
+                let record = Record::from_rdata(name.clone(), ttl, rdata);
+                records.push(record.into_record_of_rdata());
             }
         }
 
@@ -750,7 +745,7 @@ impl InnerInMemory {
 
         rr_set.clear_rrsigs();
 
-        let rrsig_temp = Record::with(rr_set.name().clone(), RecordType::RRSIG, zone_ttl);
+        let rrsig_temp = Record::update0(rr_set.name().clone(), zone_ttl, RecordType::RRSIG);
 
         for signer in secure_keys {
             debug!(
@@ -800,7 +795,7 @@ impl InnerInMemory {
             };
 
             let mut rrsig = rrsig_temp.clone();
-            rrsig.set_data(Some(RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::new(
+            rrsig.set_data(RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::new(
                 // type_covered: RecordType,
                 rr_set.record_type(),
                 // algorithm: Algorithm,
@@ -819,7 +814,7 @@ impl InnerInMemory {
                 signer.signer_name().clone(),
                 // sig: Vec<u8>
                 signature,
-            )))));
+            ))));
 
             rr_set.insert_rrsig(rrsig);
         }
@@ -869,14 +864,14 @@ fn maybe_next_name(
         | (t @ RecordType::ANAME, RecordType::ANAME) => record_set
             .records_without_rrsigs()
             .next()
-            .and_then(Record::data)
+            .map(Record::data)
             .and_then(RData::as_aname)
             .map(|aname| LowerName::from(&aname.0))
             .map(|name| (name, t)),
         (t @ RecordType::NS, RecordType::NS) => record_set
             .records_without_rrsigs()
             .next()
-            .and_then(Record::data)
+            .map(Record::data)
             .and_then(RData::as_ns)
             .map(|ns| LowerName::from(&ns.0))
             .map(|name| (name, t)),
@@ -884,14 +879,14 @@ fn maybe_next_name(
         (t @ RecordType::CNAME, _) => record_set
             .records_without_rrsigs()
             .next()
-            .and_then(Record::data)
+            .map(Record::data)
             .and_then(RData::as_cname)
             .map(|cname| LowerName::from(&cname.0))
             .map(|name| (name, t)),
         (t @ RecordType::MX, RecordType::MX) => record_set
             .records_without_rrsigs()
             .next()
-            .and_then(Record::data)
+            .map(Record::data)
             .and_then(RData::as_mx)
             .map(|mx| mx.exchange().clone())
             .map(LowerName::from)
@@ -899,7 +894,7 @@ fn maybe_next_name(
         (t @ RecordType::SRV, RecordType::SRV) => record_set
             .records_without_rrsigs()
             .next()
-            .and_then(Record::data)
+            .map(Record::data)
             .and_then(RData::as_srv)
             .map(|srv| srv.target().clone())
             .map(LowerName::from)
@@ -1062,8 +1057,7 @@ impl Authority for InMemoryAuthority {
                                 // in the case of ANAME the final record should be the A or AAAA record
                                 let (rdatas, a_aaaa_ttl) = {
                                     let last_record = additionals.last();
-                                    let a_aaaa_ttl =
-                                        last_record.map_or(u32::max_value(), |r| r.ttl());
+                                    let a_aaaa_ttl = last_record.map_or(u32::MAX, |r| r.ttl());
 
                                     // grap the rdatas
                                     let rdatas: Option<Vec<RData>> = last_record
@@ -1075,10 +1069,7 @@ impl Authority for InMemoryAuthority {
                                             _ => None,
                                         })
                                         .map(|records| {
-                                            records
-                                                .filter_map(Record::data)
-                                                .cloned()
-                                                .collect::<Vec<_>>()
+                                            records.map(Record::data).cloned().collect::<Vec<_>>()
                                         });
 
                                     (rdatas, a_aaaa_ttl)
@@ -1266,7 +1257,7 @@ impl Authority for InMemoryAuthority {
                     rr_set
                         .records(false, SupportedAlgorithms::default())
                         .next()
-                        .and_then(Record::data)
+                        .map(Record::data)
                         .and_then(RData::as_dnssec)
                         .and_then(DNSSECRData::as_nsec)
                         .map_or(false, |r| {

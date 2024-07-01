@@ -5,7 +5,7 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{net::SocketAddr, time::Instant};
 
 use async_recursion::async_recursion;
 use futures_util::{future::select_all, FutureExt};
@@ -307,12 +307,10 @@ impl Recursor {
         request_time: Instant,
         query_has_dnssec_ok: bool,
     ) -> Result<Lookup, Error> {
-        if self.security_aware {
-            // TODO RFC4035 section 4.5 recommends caching "each response as a single atomic entry
-            // containing the entire answer, including the named RRset and any associated DNSSEC
-            // RRs"
-        } else if let Some(lookup) = self.record_cache.get(&query, request_time) {
-            return lookup.map_err(Into::into);
+        if let Some(lookup) = self.record_cache.get(&query, request_time) {
+            let lookup = maybe_strip_dnssec_records(query_has_dnssec_ok, lookup?, query);
+
+            return Ok(lookup);
         }
 
         // not in cache, let's look for an ns record for lookup
@@ -353,15 +351,13 @@ impl Recursor {
         let ns = ns.ok_or_else(|| Error::from(format!("no nameserver found for {zone}")))?;
         debug!("found zone {} for {}", ns.zone(), query);
 
-        let dnssec = if self.security_aware {
-            Dnssec::Aware {
-                query_has_dnssec_ok,
-            }
-        } else {
-            Dnssec::Unaware
-        };
-        let response = self.lookup(query, ns, request_time, dnssec).await?;
-        Ok(response)
+        let response = self.lookup(query.clone(), ns, request_time).await?;
+
+        // RFC 4035 section 3.2.1 if DO bit not set, strip DNSSEC records unless
+        // explicitly requested
+        let lookup = maybe_strip_dnssec_records(query_has_dnssec_ok, response, query);
+
+        Ok(lookup)
     }
 
     async fn lookup(
@@ -369,13 +365,10 @@ impl Recursor {
         query: Query,
         ns: RecursorPool<TokioRuntimeProvider>,
         now: Instant,
-        dnssec: Dnssec,
     ) -> Result<Lookup, Error> {
-        if !dnssec.is_security_aware() {
-            if let Some(lookup) = self.record_cache.get(&query, now) {
-                debug!("cached data {lookup:?}");
-                return lookup.map_err(Into::into);
-            }
+        if let Some(lookup) = self.record_cache.get(&query, now) {
+            debug!("cached data {lookup:?}");
+            return lookup.map_err(Into::into);
         }
 
         let response = ns.lookup(query.clone(), self.security_aware);
@@ -388,44 +381,26 @@ impl Recursor {
                 let mut r = r.into_message();
                 info!("response: {}", r.header());
 
-                if let Dnssec::Aware {
-                    query_has_dnssec_ok,
-                } = dnssec
-                {
-                    // TODO: validation must be performed if the CD (Checking Disabled) is not set
-                    let mut answers = r.take_answers();
-                    if !query_has_dnssec_ok {
-                        answers.retain(|rrset| {
-                            // RFC 4035 section 3.2.1 if DO bit not set, strip DNSSEC records
-                            // unless explicitly requested
-                            let record_type = rrset.record_type();
-                            record_type == query.query_type() || !record_type.is_dnssec()
-                        });
-                    }
+                let records = r
+                    .take_answers()
+                    .into_iter()
+                    .chain(r.take_name_servers())
+                    .chain(r.take_additionals())
+                    .filter(|x| {
+                        if !is_subzone(ns.zone().clone(), x.name().clone()) {
+                            warn!(
+                                "Dropping out of bailiwick record {x} for zone {}",
+                                ns.zone().clone()
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    });
 
-                    Ok(Lookup::new_with_max_ttl(query, Arc::from(answers)))
-                } else {
-                    let records = r
-                        .take_answers()
-                        .into_iter()
-                        .chain(r.take_name_servers())
-                        .chain(r.take_additionals())
-                        .filter(|x| {
-                            if !is_subzone(ns.zone().clone(), x.name().clone()) {
-                                warn!(
-                                    "Dropping out of bailiwick record {x} for zone {}",
-                                    ns.zone().clone()
-                                );
-                                false
-                            } else {
-                                true
-                            }
-                        });
+                let lookup = self.record_cache.insert_records(query, records, now);
 
-                    let lookup = self.record_cache.insert_records(query, records, now);
-
-                    lookup.ok_or_else(|| Error::from("no records found"))
-                }
+                lookup.ok_or_else(|| Error::from("no records found"))
             }
             Err(e) => {
                 warn!("lookup error: {e}");
@@ -458,12 +433,7 @@ impl Recursor {
 
         let lookup = Query::query(zone.clone(), RecordType::NS);
         let response = self
-            .lookup(
-                lookup.clone(),
-                nameserver_pool.clone(),
-                request_time,
-                Dnssec::Unaware,
-            )
+            .lookup(lookup.clone(), nameserver_pool.clone(), request_time)
             .await?;
 
         // let zone_nameservers = response.name_servers();
@@ -476,7 +446,7 @@ impl Recursor {
 
         // unpack all glued records
         for zns in response.record_iter() {
-            if let Some(ns_data) = zns.data().and_then(RData::as_ns) {
+            if let Some(ns_data) = zns.data().as_ns() {
                 // let glue_ips = glue
                 //     .iter()
                 //     .filter(|g| g.name() == ns_data)
@@ -586,16 +556,23 @@ impl Recursor {
     }
 }
 
-enum Dnssec {
-    Unaware,
-    Aware { query_has_dnssec_ok: bool },
-}
-
-impl Dnssec {
-    #[must_use]
-    fn is_security_aware(&self) -> bool {
-        matches!(self, Self::Aware { .. })
+// as per section 3.2.1 of RFC4035
+fn maybe_strip_dnssec_records(query_has_dnssec_ok: bool, lookup: Lookup, query: Query) -> Lookup {
+    if query_has_dnssec_ok {
+        return lookup;
     }
+
+    let records = lookup
+        .records()
+        .iter()
+        .filter(|rrset| {
+            let record_type = rrset.record_type();
+            record_type == query.query_type() || !record_type.is_dnssec()
+        })
+        .cloned()
+        .collect();
+
+    Lookup::new_with_deadline(query, records, lookup.valid_until())
 }
 
 fn recursor_opts() -> ResolverOpts {
